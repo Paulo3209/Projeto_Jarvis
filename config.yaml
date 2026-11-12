@@ -1,0 +1,38 @@
+# JARVIS Config - Configuração principal (YAML)
+# Prioridade: config.yaml < .env < variáveis de ambiente do sistema
+
+# ==================== LLM Híbrido (Ollama + Gemini) ====================
+llm_primary: "ollama"              # ollama | gemini
+ollama_host: "http://localhost:11434"
+ollama_model: "llama3.1:8b"          # Modelos: llama3.1:8b, gemma3:4b, phi3:mini
+gemini_api_key: ""                 # Deixe vazio para usar .env (GEMINI_API_KEY)
+gemini_model: "gemini-3.5-flash"
+
+# ==================== TTS Híbrido (Kokoro + edge-tts) ====================
+tts_primary: "kokoro"              # kokoro | edge_tts
+kokoro_voice: "pm_alex"            # Vozes pt-BR: pm_alex, pm_santa (masc.) | pf_dora (fem.)
+edge_voice: "pt-BR-AntonioNeural"  # Voz grave masculina. Outras: pt-BR-ThalitaNeural, pt-BR-FranciscaNeural
+edge_rate: "-4%"                   # Ritmo calmo e controlado
+edge_pitch: "-8Hz"                 # Levemente mais grave
+
+# ==================== Persona J.A.R.V.I.S. ====================
+user_title: "senhor"               # Como o JARVIS se dirige a você (senhor, senhora, chefe, seu nome...)
+conversation_window: 8.0           # Segundos em que ele continua ouvindo sem precisar dizer "jarvis"
+voice_tools: true                  # Permite ações por voz (abrir apps, status do sistema, casa inteligente)
+control_mode: "full"               # full = controla PC, celular (ADB) e rede; ações perigosas pedem confirmação por voz
+                                   # safe = só ações inofensivas (abrir apps, status, casa inteligente)
+stt_model: "small"                 # Reconhecimento de fala: tiny | base | small | medium
+
+# ==================== Voice Gate (Reconhecimento de Locutor) ====================
+voice_gate_mode: "verify_sensitive"  # disabled | verify_sensitive | verify_all
+voice_gate_user: "master"
+voice_gate_threshold: 0.82         # Similaridade cosseno (0.75-0.95)
+
+# ==================== Clap Detector (2 palmas = ativa) ====================
+clap_threshold: 0.08               # RMS threshold (ajuste via calibração automática)
+
+# ==================== Sistema ====================
+wake_word: "jarvis"
+language: "pt-BR"
+auto_start: false
+log_level: "INFO"

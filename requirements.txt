@@ -1,0 +1,56 @@
+﻿# Core
+google-genai
+python-dotenv
+aioconsole
+
+# GUI (M2)
+PyQt6
+psutil
+
+# Voice (M3)
+edge-tts
+faster-whisper
+sounddevice
+soundfile
+
+# Voice Auth (Speaker Recognition)
+resemblyzer
+webrtcvad
+
+# System monitoring
+psutil
+
+# Level 6 - Desktop Automation
+pyautogui
+pygetwindow
+pillow
+opencv-python
+
+# Level 7 - Network & Bluetooth
+zeroconf
+bleak
+aiohttp
+asyncssh
+paho-mqtt
+
+# Android ADB
+# adb is system dependency, not pip
+
+# Level 8 - Vision
+ultralytics
+mss
+pytesseract
+# tesseract-ocr is system dependency
+
+# Level 9 - Agents & Planning
+APScheduler
+
+# Level 10 - Security
+cryptography
+pyjwt
+
+# Smart Home
+# Home Assistant integration via aiohttp (already included)
+
+# Utilities
+numpy

@@ -1,0 +1,31 @@
+# ==== Segredos (NUNCA versionar) ====
+.env
+*.key
+*.pem
+*.hmac
+security/*.key
+security/audit_tamper.hmac
+automation/mosquitto/config/passwd
+automation/mosquitto/data/
+automation/mosquitto/log/
+
+# ==== Dados pessoais / biométricos ====
+memory/*.db
+memory/voiceprints/
+*.db
+*.sqlite3
+
+# ==== Python / ambiente ====
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ==== Modelos e binários grandes ====
+models/
+*.onnx
+*.pth
+*.exe
+
+# ==== Pastas criadas por engano (caminho Windows sem barras) ====
+C:Users*/

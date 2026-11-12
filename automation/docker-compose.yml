@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # MQTT Broker - Comunicação cross-device
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: jarvis-mqtt
+    ports:
+      - "1883:1883"   # MQTT padrão
+      - "9001:9001"   # WebSockets (para clientes web)
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    restart: unless-stopped
+    networks:
+      - jarvis-net
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$SYS/broker/uptime", "-C", "1", "-i", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MQTT Web UI (opcional)
+  mqtt-ui:
+    image: hivemq/mqtt-web-client:latest
+    container_name: jarvis-mqtt-ui
+    ports:
+      - "8083:8080"
+    environment:
+      - MQTT_BROKER=ws://mosquitto:9001
+    depends_on:
+      - mosquitto
+    networks:
+      - jarvis-net
+
+  # Home Assistant (opcional - integração casa inteligente)
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: jarvis-homeassistant
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./homeassistant/config:/config
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    network_mode: host  # Necessário para descoberta de dispositivos
+    # profiles: ["full"]  # Descomente para ativar apenas com --profile full
+
+  # Mosquitto Exporter para Prometheus (opcional)
+  mosquitto-exporter:
+    image: evanshortiss/mosquitto-exporter:latest
+    container_name: jarvis-mqtt-exporter
+    ports:
+      - "9234:9234"
+    environment:
+      - MOSQUITTO_URL=tcp://mosquitto:1883
+    depends_on:
+      - mosquitto
+    networks:
+      - jarvis-net
+    # profiles: ["monitoring"]
+
+networks:
+  jarvis-net:
+    driver: bridge
+
+# Volumes persistentes
+volumes:
+  mosquitto-data:
+  mosquitto-log:
