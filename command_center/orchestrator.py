@@ -2,7 +2,7 @@
 Command Orchestrator - Simultaneous commands, automation rules, batch execution.
 Manages complex multi-device, multi-step command sequences.
 """
-from __future__ import __future__
+from __future__ import annotations
 import asyncio
 import logging
 import time

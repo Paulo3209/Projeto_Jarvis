@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from hybrid_intelligence.model_manager import get_model_manager, ModelManager, ModelConfig, ModelType, ModelCapability
-from hybrid_intelligence.local_llm import get_semantic_memory, SemanticMemory
+from hybrid_intelligence.semantic_memory import get_semantic_memory, SemanticMemory
 from hybrid_intelligence.research_agent import get_research_agent, ResearchAgent, ResearchTask
 
 logger = logging.getLogger(__name__)

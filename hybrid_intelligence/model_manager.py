@@ -314,13 +314,15 @@ class ModelManager:
             gen_config["max_output_tokens"] = max_tokens
 
         if stream:
-            response = await client.models.generate_content_stream(
-                model=instance.config.name,
-                contents=contents,
-                config=gen_config,
-            )
-            async for chunk in response:
-                yield chunk.text
+            async def stream_gen():
+                response = await client.models.generate_content_stream(
+                    model=instance.config.name,
+                    contents=contents,
+                    config=gen_config,
+                )
+                async for chunk in response:
+                    yield chunk.text
+            return stream_gen()
         else:
             response = await client.models.generate_content(
                 model=instance.config.name,
@@ -340,6 +342,7 @@ class ModelManager:
     ) -> Any:
         """Generate using local model (llama.cpp)."""
         llm = instance.client
+        config = instance.config
 
         # Format prompt
         full_prompt = ""

@@ -1,36 +1,39 @@
 """
 JarvisVoiceAssistant - experiência de voz estilo filme.
 
-Fluxo:
-  [espera] --"Jarvis" / 2 palmas--> overlay aparece + "Sim, senhor?"
-  [acordado] comando -> pensa (overlay dourado) -> responde falando, frase a frase
-  continua ouvindo por `conversation_window` segundos (sem precisar dizer "Jarvis")
-  silêncio -> volta ao modo espera e o overlay some.
+  [espera] -- "Jarvis" (detector dedicado) / 2 palmas --> overlay aparece
+  [comando] -> reflexo instantâneo OU IA (streaming) -> fala frase a frase
+            (a próxima frase é sintetizada enquanto a atual toca)
+  [falando] "Jarvis!" a qualquer momento -> interrompe na hora (barge-in)
+  [janela de conversa] follow-ups sem repetir o nome -> silêncio -> espera
 
-Ações sensíveis (PowerShell, desligar PC, apagar arquivo, comandos no celular...)
-só executam após confirmação por voz ("sim" / "confirmo").
+Ações sensíveis só executam após confirmação por voz ("sim" / "confirmo").
 """
 from __future__ import annotations
 
 import asyncio
 import re
 import time
-from datetime import datetime
 from typing import Optional
+
+import numpy as np
+import os
+
+DEBUG = bool(os.environ.get('JARVIS_DEBUG'))
 
 from config.settings import load_config
 from core.jarvis_agent import JarvisAgent, system_report, time_greeting
 from core.personality import Personality
 from gui.overlay_client import OverlayClient
-from voice.stt import FasterWhisperSTT, STTConfig, ModelSize, detect_wake_word
-from voice.tts_hybrid import get_hybrid_tts, TTSConfig, TTSProvider
+from voice.listener import ListenerConfig, Utterance, VoiceListener
+from voice.player import AudioPlayer, chime
+from voice.stt import FasterWhisperSTT, ModelSize, STTConfig, detect_wake_word, wake_in_text
+from voice.tts_hybrid import TTSConfig, TTSProvider, get_hybrid_tts
 
-WEEKDAYS = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
-MONTHS = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto",
-          "setembro", "outubro", "novembro", "dezembro"]
-
-YES = ("sim", "confirmo", "confirma", "pode", "afirmativo", "prossiga", "manda", "autorizo", "claro", "faça", "faca")
-NO = ("não", "nao", "cancela", "cancelar", "negativo", "espera", "pare", "aborta")
+YES = ("sim", "confirmo", "confirma", "pode", "afirmativo", "prossiga", "manda", "autorizo", "claro", "faca", "faça")
+NO = ("nao", "não", "cancela", "cancelar", "negativo", "espera", "pare", "aborta")
+STOP_WORDS = {"pare", "para", "chega", "silencio", "cancela", "cancelar", "esquece", "deixa", "ok", "tudo bem",
+              "pode parar", "cala a boca", "quieto"}
 
 TOOL_LABELS = {
     "run_powershell": "executar um comando no PowerShell",
@@ -49,7 +52,10 @@ TOOL_LABELS = {
 
 
 def _norm(text: str) -> str:
-    return re.sub(r"[^\w\s]", "", text.lower()).strip()
+    import unicodedata
+    text = unicodedata.normalize("NFD", text.lower())
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^\w\s]", "", text).strip()
 
 
 def speakable(text: str) -> str:
@@ -58,9 +64,27 @@ def speakable(text: str) -> str:
     text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"https?://\S+", "o link", text)
-    text = re.sub(r"[*_#>|~]+", "", text)
+    text = re.sub(r"[*_#>|~{}]+", "", text)
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(buf: str, first: bool) -> tuple[list[str], str]:
+    """Separa frases completas do buffer. A primeira pode ser cortada na vírgula
+    (se longa) para o JARVIS começar a falar mais cedo."""
+    out = []
+    while True:
+        m = re.search(r"(.+?[.!?…])(\s+|$)", buf, flags=re.S)
+        if first and not out and not m:
+            c = re.search(r"^(.{60,}?,)\s+(?=.{25,})", buf, flags=re.S)
+            if c:
+                out.append(c.group(1).strip())
+                buf = buf[c.end():]
+                continue
+        if not m:
+            return out, buf
+        out.append(m.group(1).strip())
+        buf = buf[m.end():]
 
 
 class JarvisVoiceAssistant:
@@ -70,6 +94,7 @@ class JarvisVoiceAssistant:
         self.title = personality.user_title
         self.window = float(self.config.get("conversation_window", 8.0))
         self.wake_word = self.config.get("wake_word", "jarvis")
+        self.barge_in = bool(self.config.get("barge_in", True))
 
         self.agent = JarvisAgent(personality, self.config)
         self.agent.confirm = self.confirm_action
@@ -81,13 +106,24 @@ class JarvisVoiceAssistant:
         except ValueError:
             model_size = ModelSize.SMALL
         self.stt = FasterWhisperSTT(STTConfig(model_size=model_size))
+        self.listener = VoiceListener(ListenerConfig(
+            wake_word=self.wake_word,
+            wake_model=str(self.config.get("wake_model", "tiny")),
+            vad_threshold=float(self.config.get("vad_threshold", 0.5)),
+        ))
+        self.player = AudioPlayer()
         self.tts = None
 
-        self._running = False
-        self._last_spoke = 0.0
-        self._tts_lock = asyncio.Lock()
-        self._clap = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._running = False
+        self._speech_lock = asyncio.Lock()
+        self._answer_task: Optional[asyncio.Task] = None
+        self._clap = asyncio.Event()
+        self._interrupted = False
+        self._confirming = False
+        self.use_microphone = True
+        self._recent_speech: list[str] = []
+        self._tts_cache: dict = {}
 
     # ==================== Inicialização ====================
     async def boot(self) -> None:
@@ -95,138 +131,244 @@ class JarvisVoiceAssistant:
         self.overlay.start()
         self.overlay.send("online", "Inicializando sistemas...")
 
-        tts_cfg = TTSConfig(
+        self.tts = await get_hybrid_tts(TTSConfig(
             primary=TTSProvider(self.config.get("tts_primary", "kokoro")),
             kokoro_voice=self.config.get("kokoro_voice", "pm_alex"),
             edge_voice=self.config.get("edge_voice", "pt-BR-AntonioNeural"),
             edge_rate=self.config.get("edge_rate", "-4%"),
             edge_pitch=self.config.get("edge_pitch", "-8Hz"),
-        )
-        self.tts = await get_hybrid_tts(tts_cfg)
+        ))
 
-        print("[JARVIS] Carregando reconhecimento de fala (o primeiro uso baixa o modelo)...")
-        await asyncio.get_running_loop().run_in_executor(None, self.stt.load_model)
+        print("[JARVIS] Carregando reconhecimento de fala e detector de wake word...")
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            loop.run_in_executor(None, self.stt.load_model),
+            loop.run_in_executor(None, self.listener.load),
+        )
         await self.agent.initialize()
 
-        greeting = f"{time_greeting(self.title)} {system_report(self.title)}"
-        await self.say(greeting)
+        self.listener.on_wake = self._on_wake
+        self.listener.start(loop, use_microphone=self.use_microphone)
+
+        # Pré-carrega a IA em segundo plano enquanto cumprimenta
+        warm = asyncio.create_task(self.agent.warmup())
+        asyncio.create_task(self._precache_phrases())
+        await self.say(f"{time_greeting(self.title)} {system_report(self.title)}")
         self.overlay.hide()
+        if not warm.done():
+            print("[JARVIS] Aquecendo a IA local em segundo plano (primeira resposta pode demorar um pouco)...")
+
+    # ==================== Eventos de ativação ====================
+    def _on_wake(self) -> None:
+        """Wake word detectado (thread do loop)."""
+        busy = self.player.playing or (self._answer_task is not None and not self._answer_task.done())
+        if busy and self.barge_in:
+            print("[JARVIS] Interrompido pelo usuário.")
+            self.interrupt()
+        self.overlay.listening()
 
     def on_double_clap(self) -> None:
         """Chamado pela thread do detector de palmas."""
         if self._loop:
-            self._loop.call_soon_threadsafe(self._clap.set)
-            self.stt._abort = True  # interrompe a escuta atual para responder já
+            self._loop.call_soon_threadsafe(self._clap_wake)
+
+    def _clap_wake(self) -> None:
+        if self.player.playing:
+            self.interrupt()
+        self._clap.set()
+
+    def interrupt(self) -> None:
+        self._interrupted = True
+        self.player.stop()
+        if self._answer_task and not self._answer_task.done():
+            self._answer_task.cancel()
+        self.listener.end_speaking()
 
     # ==================== Fala ====================
-    async def say(self, text: str, state: str = "speaking") -> None:
-        text = speakable(text)
-        if not text:
-            return
-        print(f"JARVIS: {text}")
-        async with self._tts_lock:
+    async def _play(self, samples: np.ndarray, sr: int, text: str, state: str = "speaking") -> bool:
+        async with self._speech_lock:
+            # O listener usa isso para ignorar o próprio eco e o próprio nome
+            self.listener.begin_speaking(text.replace("J.A.R.V.I.S.", "Jarvis"))
+            self._recent_speech.append(text)
+            self._recent_speech = self._recent_speech[-4:]
             self.overlay.send(state, text)
             try:
-                await self.tts.speak(text, blocking=True)
+                return await self.player.play(samples, sr)
             finally:
-                self._last_spoke = time.time()
+                self.listener.end_speaking()
 
-    async def listen(self, timeout: float) -> Optional[str]:
-        started = time.time()
-        self.stt._listening = True
-        text = await self.stt.listen_once(timeout=timeout)
-        # Se o JARVIS falou enquanto gravávamos, o áudio é a própria voz dele
-        if text and self._last_spoke > started:
-            return None
-        return text
+    async def synth(self, text: str):
+        """Síntese com cache para frases curtas e repetidas (resposta instantânea)."""
+        if text in self._tts_cache:
+            return self._tts_cache[text]
+        audio = await self.tts.synthesize(text)
+        if len(text) <= 48:
+            self._tts_cache[text] = audio
+        return audio
+
+    async def _precache_phrases(self) -> None:
+        p = self.p
+        phrases = {p._fill(x) for x in (p.acknowledgements + p.thinking + p.confirmations + p.standby)}
+        phrases |= {"Executando.", "Pausado.", "Retomando.", "Próxima faixa.", "Faixa anterior."}
+        for text in phrases:
+            try:
+                await self.synth(speakable(text))
+            except Exception:
+                pass
+
+    async def say(self, text: str, state: str = "speaking") -> bool:
+        text = speakable(text)
+        if not text:
+            return True
+        print(f"JARVIS: {text}")
+        try:
+            samples, sr = await self.synth(text)
+        except Exception as e:
+            print(f"[JARVIS] TTS falhou: {e}")
+            return True
+        return await self._play(samples, sr, text, state)
 
     # ==================== Confirmação por voz ====================
     async def confirm_action(self, tool: str, args: dict) -> bool:
         label = TOOL_LABELS.get(tool, f"usar a ferramenta {tool.replace('_', ' ')}")
         detail = ", ".join(f"{k}: {v}" for k, v in (args or {}).items())[:180]
         print(f"[JARVIS] Confirmação necessária: {tool} {args}")
-        await self.say(f"Isso requer sua autorização, {self.title}: {label}. Confirma?", state="confirm")
-        self.overlay.confirm(f"{label}\n{detail}")
-        for _ in range(2):
-            answer = await self.listen(timeout=8.0)
-            if not answer:
-                break
+        self._confirming = True
+        try:
+            await self.say(f"Isso requer sua autorização, {self.title}: {label}. Confirma?", state="confirm")
+            self.overlay.confirm(f"{label}\n{detail}")
+            answer = await self.next_command(timeout=8.0, capture=True)
+        finally:
+            self._confirming = False
+        approved = False
+        if answer:
             n = _norm(answer)
-            if any(w in n.split() or n.startswith(w) for w in NO):
-                break
-            if any(w in n.split() or n.startswith(w) for w in YES):
-                self.overlay.thinking()
-                await self.say("Executando.")
-                self.overlay.thinking()
-                return True
+            words = n.split()
+            if not any(w in words or n.startswith(w) for w in NO):
+                approved = any(w in words or n.startswith(w) for w in YES)
+        print(f"[JARVIS] Confirmação: '{answer}' -> {'APROVADA' if approved else 'NEGADA'}")
         self.overlay.thinking()
-        return False
+        if approved:
+            await self.say("Executando.")
+            self.overlay.thinking()
+        return approved
 
-    # ==================== Intenções instantâneas ====================
-    def local_intent(self, text: str) -> Optional[str]:
-        n = _norm(text)
-        now = datetime.now()
-        if re.search(r"\b(que horas|que hora|horas sao)\b", n):
-            return f"São {now.hour} e {now.minute:02d}, {self.title}." if now.minute else f"São {now.hour} em ponto, {self.title}."
-        if re.search(r"\b(que dia|data de hoje|dia e hoje)\b", n):
-            return f"Hoje é {WEEKDAYS[now.weekday()]}, {now.day} de {MONTHS[now.month - 1]}."
-        if re.search(r"\b(status|diagnostico|relatorio|como (esta|estao) o(s)? sistema)", n):
-            return system_report(self.title)
-        return None
+    # ==================== Escuta ====================
+    async def transcribe(self, utt: Utterance) -> Optional[str]:
+        text = await self.stt.transcribe_audio(utt.audio)
+        return text.strip() if text and text.strip() else None
 
-    def is_dismiss(self, text: str) -> bool:
-        n = _norm(text)
-        return n in {"obrigado", "valeu", "isso e tudo", "so isso", "dispensado", "pode ir", "modo espera",
-                     "pode descansar", "nada", "deixa", "esquece"}
+    async def next_command(self, timeout: Optional[float], capture: bool) -> Optional[str]:
+        """Espera a próxima fala-comando (ou None no timeout)."""
+        self.listener.flush()
+        self.listener.set_capture(capture)
+        try:
+            utt = await asyncio.wait_for(self.listener.commands.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self.listener.set_capture(False)
+        return await self.transcribe(utt)
 
-    def is_shutdown(self, text: str) -> bool:
-        n = _norm(text)
-        return any(k in n for k in ("desliguese", "desligue se", "encerrar sistemas", "protocolo de desligamento",
-                                    "encerre o jarvis", "desligar jarvis", "desative se"))
-
-    # ==================== Resposta do agente (streaming por frase) ====================
+    # ==================== Resposta (pipeline) ====================
     async def answer(self, text: str) -> None:
+        """IA/reflexo -> frases -> síntese (adiantada) -> reprodução interrompível."""
         self.overlay.thinking()
         sentences: asyncio.Queue = asyncio.Queue()
-        spoken_any = False
+        audio_q: asyncio.Queue = asyncio.Queue(maxsize=2)
 
-        async def producer():
-            buf = ""
+        async def produce():
+            buf, first = "", True
             try:
                 async for chunk in self.agent.respond(text, spoken=True):
                     buf += chunk
-                    while True:
-                        m = re.search(r"(.+?[.!?…])(\s+|$)", buf, flags=re.S)
-                        if not m or (m.end() == len(buf) and not chunk.endswith((" ", "\n"))):
-                            break
-                        await sentences.put(m.group(1).strip())
-                        buf = buf[m.end():]
+                    done, buf = split_sentences(buf, first)
+                    for s in done:
+                        first = False
+                        await sentences.put(s)
                 if buf.strip():
                     await sentences.put(buf.strip())
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"[JARVIS] Erro: {e}")
                 await sentences.put(f"{self.p.get_error()} Os motores de IA não responderam.")
             finally:
                 await sentences.put(None)
 
-        task = asyncio.create_task(producer())
-        caption = ""
-        while True:
-            sentence = await sentences.get()
-            if sentence is None:
-                break
-            caption = (caption + " " + sentence).strip()[-260:]
-            spoken_any = True
-            async with self._tts_lock:
-                self.overlay.speaking(caption)
+        async def synthesize():
+            filler_used = False
+            try:
+                while True:
+                    try:
+                        s = await asyncio.wait_for(sentences.get(), timeout=None if filler_used else 3.0)
+                    except asyncio.TimeoutError:
+                        # A IA está demorando: fala algo, como no filme
+                        filler_used = True
+                        if not self._confirming:
+                            s = self.p.get_thinking()
+                            await audio_q.put((s, *(await self.synth(s))))
+                        continue
+                    if s is None:
+                        break
+                    filler_used = True
+                    s = speakable(s)
+                    if not s:
+                        continue
+                    try:
+                        samples, sr = await self.synth(s)
+                    except Exception as e:
+                        print(f"[JARVIS] TTS falhou: {e}")
+                        continue
+                    await audio_q.put((s, samples, sr))
+            finally:
+                await audio_q.put(None)
+
+        producer = asyncio.create_task(produce())
+        synth = asyncio.create_task(synthesize())
+        caption, spoke = "", False
+        try:
+            while True:
+                item = await audio_q.get()
+                if item is None:
+                    break
+                sentence, samples, sr = item
+                if DEBUG and not spoke and getattr(self, "_t_cmd", None):
+                    print(f"[Tempo] comando -> 1º áudio pronto: {time.monotonic() - self._t_cmd:.2f}s")
+                caption = (caption + " " + sentence).strip()[-260:]
                 print(f"JARVIS: {sentence}")
-                try:
-                    await self.tts.speak(speakable(sentence), blocking=True)
-                finally:
-                    self._last_spoke = time.time()
-        await task
-        if not spoken_any:
-            await self.say(self.p.get_confirmation())
+                spoke = True
+                if not await self._play(samples, sr, caption):
+                    raise asyncio.CancelledError()
+            if not spoke:
+                await self.say(self.p.get_confirmation())
+        finally:
+            for task in (producer, synth):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(producer, synth, return_exceptions=True)
+
+    # ==================== Comandos especiais ====================
+    def is_echo(self, text: str) -> bool:
+        """Transcrição parecida com algo que o JARVIS acabou de falar = eco da sala."""
+        import difflib
+        n = _norm(text)
+        if len(n) < 4:
+            return False
+        for said in self._recent_speech:
+            s = _norm(said)
+            if n in s or difflib.SequenceMatcher(None, n, s).ratio() > 0.6:
+                return True
+        return False
+
+    def is_dismiss(self, text: str) -> bool:
+        return _norm(text) in {"obrigado", "valeu", "isso e tudo", "so isso", "dispensado", "pode ir",
+                               "modo espera", "pode descansar", "nada", "obrigado jarvis"}
+
+    def is_shutdown(self, text: str) -> bool:
+        n = _norm(text)
+        return any(k in n for k in ("desliguese", "desligue se", "encerrar sistemas", "protocolo de desligamento",
+                                    "encerre o jarvis", "desligar jarvis", "desativese", "desative se"))
 
     # ==================== Loop principal ====================
     async def run(self) -> None:
@@ -238,58 +380,102 @@ class JarvisVoiceAssistant:
         while self._running:
             awake = time.time() < awake_until
 
-            if self._clap.is_set():
+            # Espera: comando (fala) OU palmas OU fim da janela de conversa
+            self.listener.set_capture(awake)
+            get_cmd = asyncio.create_task(self.listener.commands.get())
+            get_clap = asyncio.create_task(self._clap.wait())
+            timeout = max(0.5, awake_until - time.time()) if awake else None
+            done, _ = await asyncio.wait({get_cmd, get_clap}, timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for t in (get_cmd, get_clap):
+                if t not in done:
+                    t.cancel()
+            self.listener.set_capture(False)
+
+            if get_clap in done:
                 self._clap.clear()
+                if get_cmd in done:  # devolve a fala que chegou junto
+                    self.listener.commands.put_nowait(get_cmd.result())
+                self.overlay.listening()
+                await self._play(chime(), 24000, "")
+                await self.say(self.p.get_acknowledgement(), state="listening")
+                self.overlay.listening()
+                awake_until = time.time() + self.window
+                continue
+
+            if not done:  # janela de conversa acabou
+                print("[JARVIS] Modo espera.")
+                self.overlay.hide()
+                awake_until = 0.0
+                continue
+
+            utt: Utterance = get_cmd.result()
+            t_cmd = time.monotonic()
+            text = await self.transcribe(utt)
+            self._t_cmd = t_cmd
+            if DEBUG:
+                print(f"[Tempo] transcrição: {time.monotonic() - t_cmd:.2f}s")
+            if not text:
+                if not awake:
+                    self.overlay.hide()
+                continue
+            print(f"Você: {text}")
+
+            if self.is_echo(text):
+                print("[JARVIS] Eco da própria voz ignorado.")
+                continue
+
+            found, rest = detect_wake_word(text, self.wake_word)
+            if not found and utt.woke:
+                # O detector rápido suspeitou de "Jarvis", mas a transcrição precisa não confirma
+                found = wake_in_text(text, self.wake_word)
+                if not found:
+                    print("[JARVIS] Falso alarme do wake word, ignorado.")
+                    if not awake:
+                        self.overlay.hide()
+                    continue
+            if found:
+                text = rest
+            elif not awake:
+                continue
+
+            if not text:
                 self.overlay.listening()
                 await self.say(self.p.get_acknowledgement(), state="listening")
                 self.overlay.listening()
                 awake_until = time.time() + self.window
                 continue
 
-            timeout = max(1.0, awake_until - time.time()) if awake else 30.0
-            text = await self.listen(timeout)
-
-            if not text:
-                if awake and time.time() >= awake_until:
-                    print("[JARVIS] Modo espera.")
-                    self.overlay.hide()
-                continue
-
-            print(f"Você: {text}")
-            if not awake:
-                found, rest = detect_wake_word(text, self.wake_word)
-                if not found:
-                    continue
-                self.overlay.listening()
-                if not rest:
-                    await self.say(self.p.get_acknowledgement(), state="listening")
-                    self.overlay.listening()
-                    awake_until = time.time() + self.window
-                    continue
-                text = rest
-            else:
-                # Já acordado: remove "jarvis" se a pessoa repetir o nome
-                found, rest = detect_wake_word(text, self.wake_word)
-                if found and rest:
-                    text = rest
-
             self.overlay.user(text)
+            n = _norm(text)
 
             if self.is_shutdown(text):
                 await self.say(self.p.get_farewell())
                 break
+            if n in STOP_WORDS:
+                # "Jarvis, pare" -> já interrompeu; só fica ouvindo
+                self.overlay.listening()
+                awake_until = time.time() + self.window
+                continue
             if self.is_dismiss(text):
                 await self.say(self.p.get_standby())
                 self.overlay.hide()
                 awake_until = 0.0
                 continue
 
-            local = self.local_intent(text)
-            if local:
-                await self.say(local)
-            else:
-                await self.answer(text)
+            self._interrupted = False
+            self._answer_task = asyncio.create_task(self.answer(text))
+            try:
+                await self._answer_task
+            except asyncio.CancelledError:
+                if not self._interrupted:
+                    raise
+            finally:
+                self._answer_task = None
 
+            await asyncio.sleep(0.25)  # deixa o eco da própria voz morrer
+            if not self._interrupted:
+                self.listener.flush()
             self.overlay.listening()
             awake_until = time.time() + self.window
 
@@ -297,7 +483,6 @@ class JarvisVoiceAssistant:
 
     async def shutdown(self) -> None:
         self._running = False
-        self.stt.stop_listening()
-        if self.tts:
-            self.tts.stop()
+        self.player.stop()
+        self.listener.stop()
         self.overlay.stop()

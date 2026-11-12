@@ -529,3 +529,24 @@ async def executor_run_adhoc(
             for task_id, r in execution.results.items()
         }
     }
+
+async def _plugin_tool_registry(tool_name: str, args: Dict):
+    """Executa uma ferramenta registrada no plugin_system."""
+    from core.plugin_system import get_tool
+    tool = get_tool(tool_name)
+    if tool and tool.function:
+        if tool.is_async:
+            return await tool.function(**args)
+        return tool.function(**args)
+    return {"success": False, "error": f"Tool not found: {tool_name}"}
+
+
+_workflow_executor: Optional[WorkflowExecutor] = None
+
+
+def get_workflow_executor() -> WorkflowExecutor:
+    """Instância compartilhada do WorkflowExecutor (usada pelo command_center)."""
+    global _workflow_executor
+    if _workflow_executor is None:
+        _workflow_executor = WorkflowExecutor(TaskExecutor(_plugin_tool_registry))
+    return _workflow_executor

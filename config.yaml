@@ -22,6 +22,15 @@ voice_tools: true                  # Permite ações por voz (abrir apps, status
 control_mode: "full"               # full = controla PC, celular (ADB) e rede; ações perigosas pedem confirmação por voz
                                    # safe = só ações inofensivas (abrir apps, status, casa inteligente)
 stt_model: "small"                 # Reconhecimento de fala: tiny | base | small | medium
+wake_model: "tiny"                 # Detector do nome "Jarvis" (leve; só ele roda o tempo todo)
+vad_threshold: 0.5                 # Sensibilidade do detector de voz humana (0.3 = mais sensível)
+barge_in: true                     # Diga "Jarvis" enquanto ele fala para interromper
+reflexes: true                     # Comandos comuns instantâneos, sem IA
+
+# ==================== Velocidade da IA local ====================
+ollama_keep_alive: "30m"           # Mantém o modelo na memória entre comandos
+ollama_tool_mode: "prompted"       # prompted = catálogo de ferramentas em cache (muito mais rápido na CPU)
+ollama_chat_model: "gemma3:4b"            # Opcional: modelo menor só para conversa (ex.: gemma3:4b) - usa mais RAM
 
 # ==================== Voice Gate (Reconhecimento de Locutor) ====================
 voice_gate_mode: "verify_sensitive"  # disabled | verify_sensitive | verify_all

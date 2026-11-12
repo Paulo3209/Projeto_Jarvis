@@ -36,6 +36,7 @@ class DeviceStatus(Enum):
     """Device connection status."""
     DISCOVERED = "discovered"       # Found but not authenticated
     AUTHENTICATING = "authenticating"
+    CONNECTING = "authenticating"   # alias (usado por command_center)
     CONNECTED = "connected"         # Authenticated and ready
     DISCONNECTED = "disconnected"   # Was connected, now offline
     ERROR = "error"                 # Connection error

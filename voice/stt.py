@@ -44,7 +44,7 @@ class STTConfig:
     compute_type: ComputeType = ComputeType.INT8
     device: str = "auto"       # "auto", "cpu", "cuda"
     language: str = "pt"       # Language code
-    beam_size: int = 5
+    beam_size: int = 1          # 1 = greedy: ~2-3x mais rápido que 5 na CPU
     vad_filter: bool = True    # Voice Activity Detection
     vad_min_silence_duration: float = 0.5  # seconds (Silero VAD dentro do Whisper)
     vad_threshold: float = 0.5  # Silero VAD threshold (0-1) - NÃO é energia do microfone
@@ -153,7 +153,10 @@ class FasterWhisperSTT:
                 self.config.model_size.value,
                 device=self.config.device,
                 compute_type=self.config.compute_type.value,
+                cpu_threads=max(4, (os.cpu_count() or 8) // 2),  # usa todos os núcleos físicos
             )
+            # Aquece: a 1ª inferência do CTranslate2 é bem mais lenta
+            list(self._model.transcribe(np.zeros(16000, np.float32), language=self.config.language)[0])
             print("[STT] Modelo carregado!")
 
     def _audio_to_wav_bytes(self, audio: np.ndarray) -> bytes:
@@ -178,27 +181,23 @@ class FasterWhisperSTT:
         loop = asyncio.get_event_loop()
 
         def _transcribe():
-            wav_bytes = self._audio_to_wav_bytes(audio)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(wav_bytes)
-                tmp_path = tmp.name
-
-            try:
-                segments, info = self._model.transcribe(
-                    tmp_path,
-                    language=self.config.language,
-                    beam_size=self.config.beam_size,
-                    initial_prompt=self.config.initial_prompt or None,
-                    vad_filter=self.config.vad_filter,
-                    vad_parameters=dict(
-                        min_silence_duration_ms=int(self.config.vad_min_silence_duration * 1000),
-                        threshold=self.config.vad_threshold,
-                    ) if self.config.vad_filter else None,
-                )
-                text = " ".join(seg.text for seg in segments).strip()
-                return text
-            finally:
-                os.unlink(tmp_path)
+            # Passa o array direto (16 kHz float32): evita gravar WAV e decodificar
+            # com PyAV, que quebra em algumas versões ("metadata_errors").
+            samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+            segments, info = self._model.transcribe(
+                samples,
+                language=self.config.language,
+                beam_size=self.config.beam_size,
+                initial_prompt=self.config.initial_prompt or None,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                vad_filter=self.config.vad_filter,
+                vad_parameters=dict(
+                    min_silence_duration_ms=int(self.config.vad_min_silence_duration * 1000),
+                    threshold=self.config.vad_threshold,
+                ) if self.config.vad_filter else None,
+            )
+            return " ".join(seg.text for seg in segments).strip()
 
         return await loop.run_in_executor(None, _transcribe)
 
@@ -364,6 +363,32 @@ def detect_wake_word(text: str, wake_word: str = "jarvis") -> tuple[bool, str]:
                 rest = words[i + 1:]
             return True, " ".join(rest).strip(" ,.!?;:-")
     return False, text
+
+
+def wake_in_text(text: str, wake_word: str = "jarvis", fuzzy: bool = True) -> bool:
+    """True se o texto contém o wake word. Com `fuzzy`, aceita transcrições
+    aproximadas do Whisper tiny ("Já é visto", "jaevis", "jarvi")."""
+    if detect_wake_word(text, wake_word)[0]:
+        return True
+    if not fuzzy:
+        return False
+    import difflib
+    target = _normalize(wake_word)
+    words = [_re.sub(r"[^a-z]", "", _normalize(w)) for w in text.split()[:5]]
+    words = [w for w in words if w]
+    # Junta até 3 palavras vizinhas ("ja e visto" -> "jaevisto") e compara prefixos
+    for i in range(len(words)):
+        joined = ""
+        for w in words[i:i + 3]:
+            joined += w
+            for n in range(len(target) - 1, len(target) + 2):
+                cand = joined[:n]
+                if len(cand) >= len(target) - 1 and cand[0] in "jgc" and \
+                        ("rv" in cand or "ev" in cand) and \
+                        not any(x.startswith(("revis", "previs", "ervil")) for x in words[i + 1:i + 3]) and \
+                        difflib.SequenceMatcher(None, cand, target).ratio() >= 0.8:
+                    return True
+    return False
 
 # Convenience functions
 async def transcribe_once(

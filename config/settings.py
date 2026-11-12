@@ -41,6 +41,13 @@ DEFAULT_CONFIG = {
     "conversation_window": 8.0,        # Segundos ouvindo follow-ups sem precisar dizer "jarvis"
     "voice_tools": True,               # Permite ações (abrir apps, status, casa) por voz
     "control_mode": "full",            # full = PC/celular/rede (ações perigosas pedem confirmação) | safe
+    "wake_model": "tiny",              # Whisper só para detectar "Jarvis" (rápido)
+    "vad_threshold": 0.5,              # Sensibilidade do detector de voz (Silero)
+    "barge_in": True,                  # Dizer "Jarvis" interrompe a fala dele
+    "reflexes": True,                  # Comandos comuns sem IA (abrir app, volume, status...)
+    "ollama_chat_model": "",           # Modelo menor só para conversa (ex.: gemma3:4b). Vazio = mesmo modelo
+    "ollama_keep_alive": "30m",        # Mantém o modelo carregado entre comandos
+    "ollama_tool_mode": "prompted",    # prompted (rápido, catálogo em cache) | native
     "stt_model": "small",              # tiny | base | small | medium (pt-BR: small é bem melhor que base)
 
     # System
@@ -91,7 +98,7 @@ def load_config() -> dict:
         val = os.getenv(env_var)
         if val is not None:
             # Type conversion
-            if key in ("voice_gate_threshold", "clap_threshold", "conversation_window"):
+            if key in ("voice_gate_threshold", "clap_threshold", "conversation_window", "vad_threshold"):
                 config[key] = float(val)
             elif key == "auto_start":
                 config[key] = val.lower() in ("true", "1", "yes")

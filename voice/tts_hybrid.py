@@ -175,6 +175,25 @@ class KokoroTTS(BaseTTS):
         except Exception as e:
             raise RuntimeError(f"Kokoro: {e}") from e
 
+    async def synthesize(self, text: str):
+        """Gera o áudio sem tocar. Retorna (samples float32 mono, sample_rate)."""
+        await self._ensure_model()
+        import numpy as np
+        loop = asyncio.get_running_loop()
+        try:
+            if self._use_onnx:
+                samples, sr = await loop.run_in_executor(None, lambda: self._model.create(
+                    text, voice=self.config.kokoro_voice, speed=self.config.kokoro_speed, lang="pt-br"))
+                return np.asarray(samples, dtype=np.float32), sr
+
+            def _gen():
+                chunks = [audio for _, _, audio in self._model(
+                    text, voice=self.config.kokoro_voice, speed=self.config.kokoro_speed)]
+                return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, np.float32)
+            return await loop.run_in_executor(None, _gen), self.config.sample_rate
+        except Exception as e:
+            raise RuntimeError(f"Kokoro: {e}") from e
+
     async def speak_stream(self, text: str) -> AsyncGenerator[bytes, None]:
         """Stream não implementado para Kokoro (usa speak bloqueante)."""
         success = await self.speak(text, blocking=False)
@@ -235,6 +254,42 @@ class EdgeTTS(BaseTTS):
 
             os.unlink(tmp_path)
             return True
+        except Exception as e:
+            raise RuntimeError(f"edge-tts: {e}") from e
+
+    async def synthesize(self, text: str):
+        """Gera o áudio em memória sem tocar. Retorna (samples float32 mono, sample_rate)."""
+        if not EDGE_TTS_AVAILABLE:
+            raise RuntimeError("edge-tts não instalado")
+        import io
+        import numpy as np
+        import soundfile as sf
+        try:
+            buf = bytearray()
+            for attempt in range(3):  # o serviço do edge-tts falha de forma intermitente
+                try:
+                    communicate = edge_tts.Communicate(
+                        text, voice=self.config.edge_voice, rate=self.config.edge_rate,
+                        pitch=self.config.edge_pitch)
+                    buf = bytearray()
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            buf.extend(chunk["data"])
+                    if buf:
+                        break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                await asyncio.sleep(0.3 * (attempt + 1))
+            if not buf:
+                raise RuntimeError("áudio vazio")
+
+            def _decode():
+                data, sr = sf.read(io.BytesIO(bytes(buf)), dtype="float32")
+                if data.ndim > 1:
+                    data = data.mean(axis=1)
+                return np.ascontiguousarray(data), sr
+            return await asyncio.get_running_loop().run_in_executor(None, _decode)
         except Exception as e:
             raise RuntimeError(f"edge-tts: {e}") from e
 
@@ -326,6 +381,20 @@ class HybridTTS:
                 print(f"[HybridTTS] Erro final: {e}")
                 return False
         return False
+
+    async def synthesize(self, text: str):
+        """Sintetiza com fallback entre provedores. Retorna (samples, sample_rate)."""
+        last = None
+        for attempt in range(2):
+            provider = self._get_provider()
+            try:
+                return await provider.synthesize(text)
+            except Exception as e:
+                last = e
+                if attempt == 0 and await self._maybe_fallback(e):
+                    continue
+                break
+        raise RuntimeError(f"Nenhum TTS conseguiu sintetizar: {last}")
 
     async def speak_stream(self, text: str) -> AsyncGenerator[bytes, None]:
         provider = self._get_provider()

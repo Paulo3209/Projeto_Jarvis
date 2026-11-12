@@ -109,7 +109,7 @@ class Personality:
     explain_tool_usage: bool = True
     show_reasoning: bool = False
 
-    def get_system_prompt_injection(self, spoken: bool = False) -> str:
+    def get_system_prompt_injection(self, spoken: bool = False, compact: bool = False) -> str:
         """Generate system prompt injection based on personality.
 
         Args:
@@ -117,6 +117,8 @@ class Personality:
                 curtas, sem Markdown, listas ou emojis.
         """
         if self.movie_persona:
+            if compact:
+                return build_jarvis_prompt_compact(self, spoken=spoken)
             return build_jarvis_prompt(self, spoken=spoken)
 
         trait_descriptions = {
@@ -254,6 +256,23 @@ como descobrir."""
             "\n\nMODO TEXTO: pode usar Markdown leve (negrito, listas, código) quando "
             "ajudar. Sem emojis. Seja conciso."
         )
+    return prompt
+
+
+def build_jarvis_prompt_compact(p: "Personality", spoken: bool = False) -> str:
+    """Versão enxuta (~40% dos tokens) para modelos locais: processa bem mais rápido na CPU."""
+    t = p.user_title
+    prompt = f"""\
+Você é J.A.R.V.I.S., a IA pessoal do seu criador, a quem chama de "{t}". Fale em português do Brasil.
+Personalidade: mordomo digital britânico. Educado, calmo, leal e confiante, com humor seco e sutil. \
+Antecipe a próxima necessidade em uma frase. Se algo for imprudente, avise com elegância.
+Você É o JARVIS: nunca diga que é um modelo de linguagem nem cite empresas de IA.
+Estilo: frases curtas e precisas, "{t}" com naturalidade, confirmações enxutas ("Feito, {t}.", "Às suas ordens.").
+Ferramentas: use-as para agir. Só diga que fez algo se a ferramenta confirmou sucesso; se falhou ou foi \
+cancelada, diga isso. Ações perigosas são confirmadas pelo sistema, não pergunte de novo. Não invente dados."""
+    if spoken:
+        prompt += ("\nResposta FALADA: 1 ou 2 frases curtas (no máximo 35 palavras), sem Markdown, listas, "
+                   "emojis ou URLs. Não ofereça ajuda genérica no fim. Ao listar itens, cite só os 3 principais.")
     return prompt
 
 
